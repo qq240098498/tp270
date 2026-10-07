@@ -16,7 +16,7 @@ const DEFAULT_SETTINGS = {
   annualPermitCodTons: 12,
   annualPermitAmmoniaTons: 1.8,
   permitYearStart: '2026-01-01',
-  tonsDivisor: 1000000000,
+  tonsDivisor: 1000000000, // mg/吨：1 吨 = 1e9 mg；排放量换算见 monitor.js 的 hourlyEmissionTons
 };
 
 function normalize(raw) {

@@ -43,6 +43,16 @@ function flowAt(data, reading) {
   return row ? Number(row.value) : 0;
 }
 
+// 量纲换算（月总量、季度总量、年累计、报表与页面全链路只此一处）：
+//   每小时排放量(mg) = 折算浓度(mg/L) × 流量(m³/h) × 1(h) × 1000(L/m³)
+//   每小时排放量(吨) = 每小时排放量(mg) ÷ tonsDivisor(mg/吨，默认 1e9)
+// 毫克每升乘立方米每小时，得到的是每小时多少「mg/L·m³」，必须乘 1000 L/m³ 化成 mg，再除以 mg/吨 才是吨
+const LITERS_PER_CUBIC_METER = 1000;
+function hourlyEmissionTons(concentrationMgPerL, flowM3PerHour, settings) {
+  const mg = concentrationMgPerL * flowM3PerHour * LITERS_PER_CUBIC_METER;
+  return mg / Number(settings.tonsDivisor);
+}
+
 function isStopped(data, reading) {
   const outlet = outletOf(data, reading.outletId);
   const plant = outlet ? plantOf(data, outlet.plantId) : null;
@@ -120,27 +130,24 @@ function monthAverage(data, outletId, metric, month) {
   return store.round(sum / days, 2);
 }
 
-// 月总量（吨）：逐小时浓度乘以流量相加
+// 月总量（吨）：逐小时按时刻配对累加——浓度与流量取同一时刻的那一对（该小时缺流量读数按 0 计），经统一换算
 function monthTotal(data, outletId, metric, month) {
   const settings = data.settings;
   const concRows = readingsOf(data, { outletId, metric, month }).filter((r) => isCounted(r, deviceOf(data, r.deviceId), settings));
-  const flowRows = readingsOf(data, { outletId, metric: '流量', month }).filter((r) => isCounted(r, deviceOf(data, r.deviceId), settings));
-  let mg = 0;
-  for (let i = 0; i < concRows.length; i += 1) {
-    const flow = flowRows[i] ? Number(flowRows[i].value) : 0;
-    mg += effectiveConcentration(concRows[i], settings) * flow;
+  let tons = 0;
+  for (const row of concRows) {
+    tons += hourlyEmissionTons(effectiveConcentration(row, settings), flowAt(data, row), settings);
   }
-  return store.round(mg / Number(settings.tonsDivisor), 4);
+  return store.round(tons, 4);
 }
 
-// 季度总量：按当季日均乘以季节天数
+// 季度总量（吨）：当季三个月的月总量直接相加，等价于季度内逐小时累加；不做任何按天外推
 function quarterTotal(data, outletId, metric, quarter) {
   const [y, q] = String(quarter).split('-Q').map(Number);
   const months = [(q - 1) * 3 + 1, (q - 1) * 3 + 2, (q - 1) * 3 + 3].map((m) => y + '-' + String(m).padStart(2, '0'));
-  const totals = months.filter((m) => dailySeries(data, outletId, metric, m).length).map((m) => monthTotal(data, outletId, metric, m));
-  if (!totals.length) return 0;
-  const average = totals.reduce((a, b) => a + b, 0) / totals.length;
-  return store.round((average / store.daysInMonth(months[0])) * 90, 4);
+  let tons = 0;
+  for (const m of months) tons += monthTotal(data, outletId, metric, m);
+  return store.round(tons, 4);
 }
 
 // 季度许可量：年度许可按季度平均分解
@@ -150,13 +157,32 @@ function quarterPermitTons(data, metric, quarter) {
   return store.round(annual / 4, 4);
 }
 
-// 年累计：把库里的全部数据加起来
+// 许可年窗口：从许可年起始日的周年区间，返回 [起月, 止月) 两个 'YYYY-MM'；月份整体归属其所在的许可年
+function permitYearMonths(permitYearStart, nowText) {
+  const sm = Number(String(permitYearStart).slice(5, 7));
+  const sd = Number(String(permitYearStart).slice(8, 10));
+  const ny = Number(String(nowText).slice(0, 4));
+  const nm = Number(String(nowText).slice(5, 7));
+  const nd = Number(String(nowText).slice(8, 10));
+  let y = ny;
+  if (nm < sm || (nm === sm && nd < sd)) y -= 1;
+  const mm = String(sm).padStart(2, '0');
+  return [y + '-' + mm, (y + 1) + '-' + mm];
+}
+
+// 年累计（吨）：按许可年累计——只加当前许可年窗口内的月份，跨许可年的数据不带入
 function accumulatedTons(data, metric) {
-  const outlets = data.outlets.map((o) => o.id);
+  const now = store.nowText();
   let total = 0;
-  for (const outletId of outlets) {
-    const months = Array.from(new Set(data.readings.filter((r) => r.outletId === outletId && r.metric === metric).map((r) => store.monthOf(r.at))));
-    for (const month of months) total += monthTotal(data, outletId, metric, month);
+  for (const outlet of data.outlets) {
+    const plant = plantOf(data, outlet.plantId);
+    const start = (plant && plant.permitYearStart) || data.settings.permitYearStart;
+    const bounds = permitYearMonths(start, now);
+    const months = Array.from(new Set(data.readings.filter((r) => r.outletId === outlet.id && r.metric === metric).map((r) => store.monthOf(r.at))));
+    for (const month of months) {
+      if (month < bounds[0] || month >= bounds[1]) continue;
+      total += monthTotal(data, outlet.id, metric, month);
+    }
   }
   return store.round(total, 4);
 }
@@ -227,7 +253,7 @@ function outletSummary(data, outletId, month) {
 
 module.exports = {
   plantOf, outletOf, deviceOf,
-  readingsOf, isCounted, effectiveConcentration, oxygenAt, flowAt,
+  readingsOf, isCounted, effectiveConcentration, oxygenAt, flowAt, hourlyEmissionTons,
   dayRows, dailyStats, dailySeries, monthAverage, monthTotal, quarterTotal, quarterPermitTons, accumulatedTons,
   exceedance, outletsOf, outletSummary,
 };
