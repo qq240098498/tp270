@@ -78,6 +78,12 @@ function daysInQuarter(quarter) {
   return total;
 }
 
+function daysInYear(year) {
+  let total = 0;
+  for (let m = 1; m <= 12; m += 1) total += daysInMonth(year + '-' + String(m).padStart(2, '0'));
+  return total;
+}
+
 function monthOf(at) {
   return String(at).slice(0, 7);
 }
@@ -98,6 +104,6 @@ function nowText() {
 }
 
 module.exports = {
-  load, save, nextId, normalize, round, daysInMonth, daysInQuarter, monthOf, dayOf, quarterOf, nowText,
+  load, save, nextId, normalize, round, daysInMonth, daysInQuarter, daysInYear, monthOf, dayOf, quarterOf, nowText,
   DEFAULT_SETTINGS, dataFile,
 };

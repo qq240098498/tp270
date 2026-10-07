@@ -49,8 +49,8 @@ function overview(data) {
     reportCount: data.reports.length,
     submittedReportCount: data.reports.filter((r) => r.status === '已上报').length,
     exceededOutletCount: outletRows.filter((s) => s.rows.some((r) => r.exceeded)).length,
-    accumulatedCodTons: monitor.accumulatedTons(data, 'COD'),
-    accumulatedAmmoniaTons: monitor.accumulatedTons(data, '氨氮'),
+    accumulatedCodTons: monitor.accumulatedTons(data, 'COD', { asOf: month }),
+    accumulatedAmmoniaTons: monitor.accumulatedTons(data, '氨氮', { asOf: month }),
     permitCodTons: Number(settings.annualPermitCodTons),
     permitAmmoniaTons: Number(settings.annualPermitAmmoniaTons),
     settings: {

@@ -120,43 +120,82 @@ function monthAverage(data, outletId, metric, month) {
   return store.round(sum / days, 2);
 }
 
-// 月总量（吨）：逐小时浓度乘以流量相加
-function monthTotal(data, outletId, metric, month) {
+// —— 排放量量纲（全系统只有这一处换算，月总量、季度总量、年累计都从这里过）——
+// 每小时排放量(吨) = 折算浓度(mg/L) × 流量(m³/h) × 1000(L/m³) ÷ tonsDivisor(mg/吨，默认 1e9)
+// 量纲链：mg/L × m³/h 得到的是「每立方米水在某小时内含多少毫克」的乘积，单位是 mg·m³/(L·h)，
+// 必须乘 1000 L/m³ 把升折算成立方米才得到 mg/h，再除以 1e9 mg/吨 得到 吨/h。
+// 漏掉 ×1000 这一步，结果会小三个数量级（2026-10 前就是这么错的）。
+const LITERS_PER_CUBIC_METER = 1000; // 1 m³ = 1000 L，物理常数
+
+function hourlyEmissionTons(concentrationMgPerL, flowM3PerHour, settings) {
+  const mgPerHour = Number(concentrationMgPerL) * Number(flowM3PerHour) * LITERS_PER_CUBIC_METER;
+  return mgPerHour / Number(settings.tonsDivisor);
+}
+
+// 逐小时累加：浓度与流量必须取同一时刻的那一对；某时刻没有流量读数时，该小时排放量按 0 计。
+// inWindow(at) 决定哪些小时进窗口——月、季度、年累计只是窗口不同，换算与配对完全相同。
+function emissionTons(data, outletId, metric, inWindow) {
   const settings = data.settings;
-  const concRows = readingsOf(data, { outletId, metric, month }).filter((r) => isCounted(r, deviceOf(data, r.deviceId), settings));
-  const flowRows = readingsOf(data, { outletId, metric: '流量', month }).filter((r) => isCounted(r, deviceOf(data, r.deviceId), settings));
-  let mg = 0;
-  for (let i = 0; i < concRows.length; i += 1) {
-    const flow = flowRows[i] ? Number(flowRows[i].value) : 0;
-    mg += effectiveConcentration(concRows[i], settings) * flow;
+  const flowByAt = {};
+  for (const r of readingsOf(data, { outletId, metric: '流量' })) {
+    if (isCounted(r, deviceOf(data, r.deviceId), settings)) flowByAt[r.at] = Number(r.value);
   }
-  return store.round(mg / Number(settings.tonsDivisor), 4);
+  let tons = 0;
+  for (const r of readingsOf(data, { outletId, metric })) {
+    if (!inWindow(r.at)) continue;
+    if (!isCounted(r, deviceOf(data, r.deviceId), settings)) continue;
+    tons += hourlyEmissionTons(effectiveConcentration(r, settings), flowByAt[r.at] || 0, settings);
+  }
+  return tons;
 }
 
-// 季度总量：按当季日均乘以季节天数
+// 月总量（吨）：当月逐小时累加
+function monthTotal(data, outletId, metric, month) {
+  return store.round(emissionTons(data, outletId, metric, (at) => store.monthOf(at) === month), 4);
+}
+
+// 季度总量（吨）：当季逐小时累加，与月总量同一套换算，不做任何按天外推
 function quarterTotal(data, outletId, metric, quarter) {
-  const [y, q] = String(quarter).split('-Q').map(Number);
-  const months = [(q - 1) * 3 + 1, (q - 1) * 3 + 2, (q - 1) * 3 + 3].map((m) => y + '-' + String(m).padStart(2, '0'));
-  const totals = months.filter((m) => dailySeries(data, outletId, metric, m).length).map((m) => monthTotal(data, outletId, metric, m));
-  if (!totals.length) return 0;
-  const average = totals.reduce((a, b) => a + b, 0) / totals.length;
-  return store.round((average / store.daysInMonth(months[0])) * 90, 4);
+  return store.round(emissionTons(data, outletId, metric, (at) => store.quarterOf(store.monthOf(at)) === quarter), 4);
 }
 
-// 季度许可量：年度许可按季度平均分解
+// 季度许可量：年许可量 × 该季度实际天数 ÷ 全年天数
 function quarterPermitTons(data, metric, quarter) {
   const settings = data.settings;
   const annual = metric === '氨氮' ? Number(settings.annualPermitAmmoniaTons) : Number(settings.annualPermitCodTons);
-  return store.round(annual / 4, 4);
+  const year = String(quarter).slice(0, 4);
+  return store.round((annual * store.daysInQuarter(quarter)) / store.daysInYear(year), 4);
 }
 
-// 年累计：把库里的全部数据加起来
-function accumulatedTons(data, metric) {
-  const outlets = data.outlets.map((o) => o.id);
+// 许可年窗口 [start, end)：参考月一日所在的那个许可年，从许可年起始日的周年起算一年
+function permitYearWindow(permitYearStart, refMonth) {
+  const [, sm, sd] = String(permitYearStart).split('-').map(Number);
+  const [ry, rm] = String(refMonth).split('-').map(Number);
+  let y = ry;
+  if (rm < sm || (rm === sm && sd > 1)) y = ry - 1;
+  const p = (n) => String(n).padStart(2, '0');
+  return { start: y + '-' + p(sm) + '-' + p(sd), end: y + 1 + '-' + p(sm) + '-' + p(sd) };
+}
+
+function latestMonth(data) {
+  const months = data.readings.map((r) => store.monthOf(r.at)).sort();
+  return months.length ? months[months.length - 1] : store.nowText().slice(0, 7);
+}
+
+// 年累计（吨）：按许可年累计（单位台账里的许可年起始日），跨自然年不重置，
+// 也不带入其他许可年的数据。opts.outletId 给定时只算这个排放口，否则全部排放口合计
+// （每个排放口各自按其单位的许可年取窗）；opts.asOf 是参考月，缺省取数据里最新的月份。
+function accumulatedTons(data, metric, opts) {
+  const o = opts || {};
+  const outletIds = o.outletId ? [o.outletId] : data.outlets.map((x) => x.id);
+  const refMonth = o.asOf || latestMonth(data);
   let total = 0;
-  for (const outletId of outlets) {
-    const months = Array.from(new Set(data.readings.filter((r) => r.outletId === outletId && r.metric === metric).map((r) => store.monthOf(r.at))));
-    for (const month of months) total += monthTotal(data, outletId, metric, month);
+  for (const outletId of outletIds) {
+    const outlet = outletOf(data, outletId);
+    const plant = outlet ? plantOf(data, outlet.plantId) : null;
+    const permitStart = (plant && plant.permitYearStart) || data.settings.permitYearStart;
+    const win = permitYearWindow(permitStart, refMonth);
+    total += emissionTons(data, outletId, metric, (at) => at >= win.start && at < win.end);
   }
   return store.round(total, 4);
 }
@@ -219,8 +258,8 @@ function outletSummary(data, outletId, month) {
     quarterTotalCod: quarterTotal(data, outletId, 'COD', store.quarterOf(month)),
     permitCodTons: quarterPermitTons(data, 'COD', store.quarterOf(month)),
     annualPermitCodTons: Number(settings.annualPermitCodTons),
-    accumulatedCodTons: accumulatedTons(data, 'COD'),
-    accumulatedAmmoniaTons: accumulatedTons(data, '氨氮'),
+    accumulatedCodTons: accumulatedTons(data, 'COD', { outletId, asOf: month }),
+    accumulatedAmmoniaTons: accumulatedTons(data, '氨氮', { outletId, asOf: month }),
     settings,
   };
 }
@@ -228,6 +267,8 @@ function outletSummary(data, outletId, month) {
 module.exports = {
   plantOf, outletOf, deviceOf,
   readingsOf, isCounted, effectiveConcentration, oxygenAt, flowAt,
-  dayRows, dailyStats, dailySeries, monthAverage, monthTotal, quarterTotal, quarterPermitTons, accumulatedTons,
+  dayRows, dailyStats, dailySeries, monthAverage,
+  hourlyEmissionTons, emissionTons, monthTotal, quarterTotal, quarterPermitTons,
+  permitYearWindow, accumulatedTons,
   exceedance, outletsOf, outletSummary,
 };
